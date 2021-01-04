@@ -29,11 +29,20 @@ inline void _scale(S s, Contour3D &m) { for (auto &p : m.points) p *= s; }
 struct Interior {
     TriangleMesh mesh;
     openvdb::FloatGrid::Ptr gridptr;
+    mutable std::optional<openvdb::FloatGrid::ConstAccessor> accessor;
+
     double closing_distance = 0.;
     double thickness = 0.;
     double voxel_scale = 1.;
     double nb_in = 3.;
     double nb_out = 3.;
+
+    void reset_accessor() const  // This resets the accessor and its cache
+    // Not a thread safe call!
+    {
+        if (gridptr)
+            accessor = gridptr->getConstAccessor();
+    }
 };
 
 void InteriorDeleter::operator()(Interior *p)
@@ -324,9 +333,199 @@ void hollow_mesh(TriangleMesh &mesh, const Interior &interior, int flags)
     mesh.require_shared_vertices();
 }
 
+static double get_distance(const Vec3f &p, const Interior &interior)
+{
+    assert(interior.gridptr);
+
+    if (!interior.accessor) interior.reset_accessor();
+
+    auto v       = (p * interior.voxel_scale).cast<double>();
+    auto grididx = interior.gridptr->transform().worldToIndexCellCentered(
+        {v.x(), v.y(), v.z()});
+
+    return interior.accessor->getValue(grididx);
+}
+
+//static auto get_distance_func(const Interior &interior)
+//{
+//    const openvdb::FloatGrid &grid = *interior.gridptr;
+
+//    auto acc = grid.getAccessor();
+
+//    float vscale = 1.;
+//    try {
+//        vscale = grid.metaValue<float>("voxel_scale");
+//    }  catch (...) {}
+
+//    auto is_inside = [&grid, acc, vscale](const Vec3f &v) {
+//        auto vd      = (v * vscale).cast<double>();
+//        auto grididx = grid.transform().worldToIndexCellCentered({vd.x(), vd.y(), vd.z()});
+//        return acc.getValue(grididx);
+//    };
+
+//    return is_inside;
+//}
+
+struct BoundingCircle
+{
+    Vec3f center;
+    float R = 0.f;
+
+    BoundingCircle(const Vec3f &p1, const Vec3f &p2, const Vec3f &p3)
+    {
+        auto a = p1 - p3, b = p2 - p3;
+        auto aXb = a.cross(b);
+
+        // https://en.wikipedia.org/wiki/Circumscribed_circle
+        // section "Higher dimensions":
+        center = p3 + (a.squaredNorm() * b - b.squaredNorm() * a).cross(aXb) /
+                          (2 * aXb.squaredNorm());
+
+        R = std::abs((p1 - center).norm());
+    }
+
+    explicit BoundingCircle(const std::array<Vec3f, 3> &pts)
+        : BoundingCircle(pts[0], pts[1], pts[2])
+    {}
+};
+
+struct DivFace { Vec3i indx; std::array<Vec3f, 3> verts; };
+
+template<class Fn>
+void divide_triangle(const DivFace &face, Fn &&visitor)
+{
+    std::array<Vec3f, 3> edges = {(face.verts[0] - face.verts[1]),
+                                  (face.verts[1] - face.verts[2]),
+                                  (face.verts[2] - face.verts[0])};
+
+    std::array<size_t, 3> edgeidx = {0, 1, 2};
+
+    std::sort(edgeidx.begin(), edgeidx.end(), [&edges](size_t e1, size_t e2) {
+        return edges[e1].squaredNorm() > edges[e2].squaredNorm();
+    });
+
+
+    DivFace child1, child2;
+    child1.indx(0) = -1;
+    child1.indx(1) = face.indx(edgeidx[1]);
+    child1.indx(2) = face.indx((edgeidx[1] + 1) % 3);
+    child1.verts[0] = (face.verts[edgeidx[0]] + face.verts[(edgeidx[0] + 1) % 3]) / 2.;
+    child1.verts[1] = face.verts[edgeidx[1]];
+    child1.verts[2] = face.verts[(edgeidx[1] + 1) % 3];
+
+    if (visitor(child1))
+        divide_triangle(child1, std::forward<Fn>(visitor));
+
+    child2.indx(0) = -1;
+    child2.indx(1) = face.indx(edgeidx[2]);
+    child2.indx(2) = face.indx((edgeidx[2] + 1) % 3);
+    child2.verts[0] = child1.verts[0];
+    child2.verts[1] = face.verts[edgeidx[2]];
+    child2.verts[2] = face.verts[(edgeidx[2] + 1) % 3];
+
+    if (visitor(child2))
+        divide_triangle(child2, std::forward<Fn>(visitor));
+}
+
+bool is_undecidable(const Interior &interior, const BoundingCircle &bc)
+{
+    double R = bc.R * interior.voxel_scale;
+    double d = get_distance(bc.center, interior);
+
+    return (d > 0. && R >= interior.nb_out) ||
+           (d < 0. && R >= interior.nb_in);
+}
+
 void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 {
+    enum TrPos { posInside, posTouch, posOutside };
 
+    auto &faces    = mesh.its.indices;
+    auto &vertices = mesh.its.vertices;
+    auto  bb       = interior.mesh.bounding_box();
+
+//    auto distfn = get_distance_func(interior);
+//    auto undecidable = [&interior](double d, const BoundingCircle &bc) {
+//        return (d > 0. && bc.R >= interior.nb_out) ||
+//               (d < 0. && bc.R >= interior.nb_in);
+//    };
+
+    std::vector<bool> to_remove(faces.size(), false);
+    std::vector<std::array<Vec3f, 3>> new_triangles;
+
+    for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx) {
+        const Vec3i &face = faces[face_idx];
+
+        std::array<Vec3f, 3> pts =
+            { vertices[face(0)], vertices[face(1)], vertices[face(2)] };
+
+        BoundingBoxf3 facebb { pts.begin(), pts.end() };
+
+        // Face is certainly outside the cavity
+        if (! facebb.intersects(bb)) continue;
+
+        BoundingCircle bcirc{pts};
+
+        bcirc.R *= interior.voxel_scale;
+        double D = get_distance(bcirc.center, interior);
+
+        bool child_touching = false;
+        if (is_undecidable(interior, bcirc)) {
+            // TODO, splitting is needed
+            auto divfn = [&child_touching, &interior](const DivFace &f)
+            {
+                BoundingCircle bc{f.verts};
+                bc.R *= interior.voxel_scale;
+
+                double subD = get_distance(bc.center, interior);
+
+                if (child_touching) return false;
+
+                if (!is_undecidable(interior, bc)) {
+                    if (!(child_touching = (subD < 0. && abs(subD) > bc.R) || std::abs(subD) < bc.R)) {
+                        //                        new_triangles.emplace_back(f.verts);
+                    }
+
+                    return false; // Don't split further
+                }
+
+                return true; // Split further
+            };
+
+            divide_triangle({faces[face_idx], pts}, divfn);
+
+        } else child_touching = (D < 0. && abs(D) > bcirc.R) || std::abs(D) < bcirc.R;
+
+        // TODO:
+        // D -= interior.closing_distance;
+        if (child_touching) { // Fully inside
+            to_remove[face_idx] = true;
+        }
+    }
+
+    auto new_faces = reserve_vector<Vec3i>(faces.size() + new_triangles.size());
+    for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx)
+        if (!to_remove[face_idx])
+            new_faces.emplace_back(faces[face_idx]);
+
+    //    for(size_t i = 0; i < new_triangles.size(); ++i) {
+    //        size_t o = vertices.size();
+    //        vertices.emplace_back(new_triangles[i][0]);
+    //        vertices.emplace_back(new_triangles[i][1]);
+    //        vertices.emplace_back(new_triangles[i][2]);
+    //        new_faces.emplace_back(int(o), int(o + 1), int(o + 2));
+    //    }
+
+    size_t cnt = std::accumulate(to_remove.begin(), to_remove.end(), size_t(0));
+
+    std::cout << cnt << " triangles removed" << std::endl;
+
+    faces.swap(new_faces);
+    new_faces = {};
+
+    mesh = TriangleMesh{mesh.its};
+    mesh.repaired = true;
+    mesh.require_shared_vertices();
 }
 
 }} // namespace Slic3r::sla

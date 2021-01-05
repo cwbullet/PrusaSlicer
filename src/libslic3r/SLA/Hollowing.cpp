@@ -326,8 +326,8 @@ void hollow_mesh(TriangleMesh &mesh, const Interior &interior, int flags)
 {
     if (mesh.empty() || interior.mesh.empty()) return;
 
-//    if (flags & hfRemoveInsideTriangles && interior.gridptr)
-//        erase_inside_triangles_2(mesh, interior);
+    if (flags & hfRemoveInsideTriangles && interior.gridptr)
+        remove_inside_triangles(mesh, interior);
 
     mesh.merge(interior.mesh);
     mesh.require_shared_vertices();
@@ -345,26 +345,6 @@ static double get_distance(const Vec3f &p, const Interior &interior)
 
     return interior.accessor->getValue(grididx);
 }
-
-//static auto get_distance_func(const Interior &interior)
-//{
-//    const openvdb::FloatGrid &grid = *interior.gridptr;
-
-//    auto acc = grid.getAccessor();
-
-//    float vscale = 1.;
-//    try {
-//        vscale = grid.metaValue<float>("voxel_scale");
-//    }  catch (...) {}
-
-//    auto is_inside = [&grid, acc, vscale](const Vec3f &v) {
-//        auto vd      = (v * vscale).cast<double>();
-//        auto grididx = grid.transform().worldToIndexCellCentered({vd.x(), vd.y(), vd.z()});
-//        return acc.getValue(grididx);
-//    };
-
-//    return is_inside;
-//}
 
 struct BoundingCircle
 {
@@ -444,12 +424,6 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     auto &vertices = mesh.its.vertices;
     auto  bb       = interior.mesh.bounding_box();
 
-//    auto distfn = get_distance_func(interior);
-//    auto undecidable = [&interior](double d, const BoundingCircle &bc) {
-//        return (d > 0. && bc.R >= interior.nb_out) ||
-//               (d < 0. && bc.R >= interior.nb_in);
-//    };
-
     std::vector<bool> to_remove(faces.size(), false);
     std::vector<std::array<Vec3f, 3>> new_triangles;
 
@@ -471,7 +445,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
         bool child_touching = false;
         if (is_undecidable(interior, bcirc)) {
-            // TODO, splitting is needed
+
             auto divfn = [&child_touching, &interior](const DivFace &f)
             {
                 BoundingCircle bc{f.verts};
@@ -504,21 +478,45 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     }
 
     auto new_faces = reserve_vector<Vec3i>(faces.size() + new_triangles.size());
-    for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx)
-        if (!to_remove[face_idx])
+    for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx) {
+        if (!to_remove[face_idx]) {
             new_faces.emplace_back(faces[face_idx]);
+        }
+        else {
+            auto divfn = [&interior, &new_triangles](const DivFace &f) {
+                BoundingCircle bc{f.verts};
+                bc.R *= interior.voxel_scale;
 
-    //    for(size_t i = 0; i < new_triangles.size(); ++i) {
-    //        size_t o = vertices.size();
-    //        vertices.emplace_back(new_triangles[i][0]);
-    //        vertices.emplace_back(new_triangles[i][1]);
-    //        vertices.emplace_back(new_triangles[i][2]);
-    //        new_faces.emplace_back(int(o), int(o + 1), int(o + 2));
-    //    }
+                double D = get_distance(bc.center, interior);
+                double d = D - bc.R;
+                if (d > 0. && d < interior.thickness) {
+                    new_triangles.emplace_back(f.verts);
+                    return false;
+                }
+
+                return false;
+            };
+
+            const Vec3i &face = faces[face_idx];
+            std::array<Vec3f, 3> pts =
+                { vertices[face(0)], vertices[face(1)], vertices[face(2)] };
+
+            divide_triangle({face, pts}, divfn);
+        }
+    }
+
+    for(size_t i = 0; i < new_triangles.size(); ++i) {
+        size_t o = vertices.size();
+        vertices.emplace_back(new_triangles[i][0]);
+        vertices.emplace_back(new_triangles[i][1]);
+        vertices.emplace_back(new_triangles[i][2]);
+        new_faces.emplace_back(int(o), int(o + 1), int(o + 2));
+    }
 
     size_t cnt = std::accumulate(to_remove.begin(), to_remove.end(), size_t(0));
 
     std::cout << cnt << " triangles removed" << std::endl;
+    std::cout << new_triangles.size() << " triangles added" << std::endl;
 
     faces.swap(new_faces);
     new_faces = {};

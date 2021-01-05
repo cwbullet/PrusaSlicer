@@ -169,16 +169,17 @@ void SLAPrint::Steps::drill_holes(SLAPrintObject &po)
     sla::hollow_mesh(hollowed_mesh, *po.m_hollowing_data->interior);
 
     TriangleMesh &mesh_view = po.m_hollowing_data->hollow_mesh_with_holes_trimmed;
-    sla::remove_inside_triangles(mesh_view, *po.m_hollowing_data->interior);
+    mesh_view = po.transformed_mesh();
+    sla::hollow_mesh(mesh_view, *po.m_hollowing_data->interior, sla::hfRemoveInsideTriangles);
 
     if (! needs_drilling) {
         BOOST_LOG_TRIVIAL(info) << "Drilling skipped (no holes).";
         return;
     }
-    
+
     BOOST_LOG_TRIVIAL(info) << "Drilling drainage holes.";
     sla::DrainHoles drainholes = po.transformed_drainhole_points();
-    
+
     std::uniform_real_distribution<float> dist(0., float(EPSILON));
     auto holes_mesh_cgal = MeshBoolean::cgal::triangle_mesh_to_cgal({});
     for (sla::DrainHole holept : drainholes) {
@@ -190,12 +191,12 @@ void SLAPrint::Steps::drill_holes(SLAPrintObject &po)
         auto cgal_m = MeshBoolean::cgal::triangle_mesh_to_cgal(m);
         MeshBoolean::cgal::plus(*holes_mesh_cgal, *cgal_m);
     }
-    
+
     if (MeshBoolean::cgal::does_self_intersect(*holes_mesh_cgal))
         throw Slic3r::SlicingError(L("Too many overlapping holes."));
-    
+
     auto hollowed_mesh_cgal = MeshBoolean::cgal::triangle_mesh_to_cgal(hollowed_mesh);
-    
+
     try {
         MeshBoolean::cgal::minus(*hollowed_mesh_cgal, *holes_mesh_cgal);
         hollowed_mesh = MeshBoolean::cgal::cgal_to_triangle_mesh(*hollowed_mesh_cgal);

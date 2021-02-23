@@ -7,6 +7,7 @@
 #include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/SimplifyMesh.hpp>
 #include <libslic3r/SLA/SupportTreeMesher.hpp>
+#include <libslic3r/BoundingCircle.hpp>
 
 #include <boost/log/trivial.hpp>
 
@@ -34,8 +35,9 @@ struct Interior {
     double closing_distance = 0.;
     double thickness = 0.;
     double voxel_scale = 1.;
-    double nb_in = 3.;
-    double nb_out = 3.;
+    double nb_in = 3.;  // narrow band width inwards
+    double nb_out = 3.; // narrow band width outwards
+    // Full narrow band is the sum of the two above values.
 
     void reset_accessor() const  // This resets the accessor and its cache
     // Not a thread safe call!
@@ -343,31 +345,16 @@ static double get_distance(const Vec3f &p, const Interior &interior)
     auto grididx = interior.gridptr->transform().worldToIndexCellCentered(
         {v.x(), v.y(), v.z()});
 
-    return interior.accessor->getValue(grididx);
+    return interior.accessor->getValue(grididx) ;
 }
 
-struct BoundingCircle
+static double get_distance_corrected(const Vec3f &p, const Interior &interior)
 {
-    Vec3f center;
-    float R = 0.f;
+    double D = get_distance(p, interior);
+    D = D - interior.closing_distance;
 
-    BoundingCircle(const Vec3f &p1, const Vec3f &p2, const Vec3f &p3)
-    {
-        auto a = p1 - p3, b = p2 - p3;
-        auto aXb = a.cross(b);
-
-        // https://en.wikipedia.org/wiki/Circumscribed_circle
-        // section "Higher dimensions":
-        center = p3 + (a.squaredNorm() * b - b.squaredNorm() * a).cross(aXb) /
-                          (2 * aXb.squaredNorm());
-
-        R = std::abs((p1 - center).norm());
-    }
-
-    explicit BoundingCircle(const std::array<Vec3f, 3> &pts)
-        : BoundingCircle(pts[0], pts[1], pts[2])
-    {}
-};
+    return D;
+}
 
 struct DivFace { Vec3i indx; std::array<Vec3f, 3> verts; };
 
@@ -407,7 +394,7 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
         divide_triangle(child2, std::forward<Fn>(visitor));
 }
 
-bool is_undecidable(const Interior &interior, const BoundingCircle &bc)
+bool is_undecidable(const Interior &interior, const BoundingCircle3f &bc)
 {
     double R = bc.R * interior.voxel_scale;
     double d = get_distance(bc.center, interior);
@@ -438,27 +425,30 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         // Face is certainly outside the cavity
         if (! facebb.intersects(bb)) continue;
 
-        BoundingCircle bcirc{pts};
-
-        bcirc.R *= interior.voxel_scale;
-        double D = get_distance(bcirc.center, interior);
+        // Create the bounding circle around the face and measure the distance
+        // of its center from the interior wall. This distance may only be valid
+        // if is within the range of the interior's voxelization distance.
+        // It will be checked further with is_undecidable() function.
+        BoundingCircle3f bcirc{pts};
+        double bcircR = bcirc.R * interior.voxel_scale;
+        double D = get_distance_corrected(bcirc.center, interior);
 
         bool child_touching = false;
         if (is_undecidable(interior, bcirc)) {
+            // D is not valid, lets split the face to reduce the bounding circle
+            // radius.
 
             auto divfn = [&child_touching, &interior](const DivFace &f)
             {
-                BoundingCircle bc{f.verts};
-                bc.R *= interior.voxel_scale;
+                BoundingCircle3f bc{f.verts};
+                double bcR  = bc.R * interior.voxel_scale;
 
-                double subD = get_distance(bc.center, interior);
+                double subD = get_distance_corrected(bc.center, interior);
 
                 if (child_touching) return false;
 
                 if (!is_undecidable(interior, bc)) {
-                    if (!(child_touching = (subD < 0. && abs(subD) > bc.R) || std::abs(subD) < bc.R)) {
-                        //                        new_triangles.emplace_back(f.verts);
-                    }
+                    child_touching = (subD < 0. && abs(subD) > bcR) || std::abs(subD) < bcR;
 
                     return false; // Don't split further
                 }
@@ -468,7 +458,8 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
             divide_triangle({faces[face_idx], pts}, divfn);
 
-        } else child_touching = (D < 0. && abs(D) > bcirc.R) || std::abs(D) < bcirc.R;
+        } else // D is reliable, check if the face touches the interior
+            child_touching = (D < 0. && abs(D) > bcircR) || std::abs(D) < bcircR;
 
         // TODO:
         // D -= interior.closing_distance;
@@ -484,17 +475,26 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         }
         else {
             auto divfn = [&interior, &new_triangles](const DivFace &f) {
-                BoundingCircle bc{f.verts};
-                bc.R *= interior.voxel_scale;
+                BoundingCircle3f bc{f.verts};
 
-                double D = get_distance(bc.center, interior);
-                double d = D - bc.R;
-                if (d > 0. && d < interior.thickness) {
+                double bcR = bc.R * interior.voxel_scale;
+
+                if (bcR > 1000. ) {
+                    std::cout << "incorrect radius" << std::endl;
+                }
+
+                double D = get_distance_corrected(bc.center, interior);
+                double d = D - bcR;
+
+                if (d >= 0.) {
                     new_triangles.emplace_back(f.verts);
                     return false;
                 }
 
-                return false;
+                if ((2 * bcR + d) < interior.thickness)
+                    return false;
+
+                return true;
             };
 
             const Vec3i &face = faces[face_idx];

@@ -85,11 +85,15 @@ public:
     // Get the mesh that is going to be printed with all the modifications
     // like hollowing and drilled holes.
     const TriangleMesh & get_mesh_to_print() const {
-        return (m_hollowing_data && is_step_done(slaposDrillHoles)) ? m_hollowing_data->hollow_mesh_with_holes_trimmed : transformed_mesh();
+        return (m_hollowing_data && is_step_done(slaposDrillHoles)) ?
+                    m_hollowing_data->hollow_mesh_with_holes_trimmed :
+                    transformed_mesh();
     }
 
     const TriangleMesh & get_mesh_to_slice() const {
-        return (m_hollowing_data && is_step_done(slaposDrillHoles)) ? m_hollowing_data->hollow_mesh_with_holes : transformed_mesh();
+        return (m_hollowing_data && is_step_done(slaposDrillHoles)) ?
+                    m_hollowing_data->hollow_mesh_with_holes :
+                    transformed_mesh();
     }
 
     // This will return the transformed mesh which is cached

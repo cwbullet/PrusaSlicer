@@ -62,6 +62,9 @@ openvdb::FloatGrid::Ptr mesh_to_grid(const TriangleMesh &            mesh,
                                  return !m->is_manifold() || m->volume() < EPSILON;
                              });
 
+    for (auto p = it; it != meshparts.end(); ++p)
+        delete *p;
+
     meshparts.erase(it, meshparts.end());
 
     openvdb::FloatGrid::Ptr grid;
@@ -69,6 +72,8 @@ openvdb::FloatGrid::Ptr mesh_to_grid(const TriangleMesh &            mesh,
         auto subgrid = openvdb::tools::meshToVolume<openvdb::FloatGrid>(
             TriangleMeshDataAdapter{*m, voxel_scale}, tr, exteriorBandWidth,
             interiorBandWidth, flags);
+
+        delete m;
 
         if (grid && subgrid) openvdb::tools::csgUnion(*grid, *subgrid);
         else if (subgrid) grid = std::move(subgrid);

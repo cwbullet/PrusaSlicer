@@ -330,7 +330,10 @@ void hollow_mesh(TriangleMesh &mesh, const Interior &interior, int flags)
     mesh.require_shared_vertices();
 }
 
-static double get_distance(const Vec3f &p, const Interior &interior)
+// Get the distance of p to the interior's zero iso_surface. Interior should
+// have its zero isosurface positioned at offset + closing_distance inwards form
+// the model surface.
+static double get_distance_raw(const Vec3f &p, const Interior &interior)
 {
     assert(interior.gridptr);
 
@@ -343,16 +346,33 @@ static double get_distance(const Vec3f &p, const Interior &interior)
     return interior.accessor->getValue(grididx) ;
 }
 
-static double get_distance_corrected(const Vec3f &p, const Interior &interior)
-{
-    double D = get_distance(p, interior);
-    D = D - interior.closing_distance;
+struct TriangleBubble { Vec3f center; double R; };
 
-    return D;
+// Return the distance of bubble center to the interior boundary or NaN if the
+// triangle is too big to be measured.
+static double get_distance(const TriangleBubble &b, const Interior &interior)
+{
+    double R = b.R * interior.voxel_scale;
+    double D = get_distance_raw(b.center, interior);
+
+    return (D > 0. && R >= interior.nb_out) ||
+           (D < 0. && R >= interior.nb_in)  ||
+           ((D - R) < 0. && 2 * R > interior.thickness) ?
+                std::nan("") :
+                D - interior.closing_distance;
 }
 
-struct DivFace { Vec3i indx; std::array<Vec3f, 3> verts; };
+// A face that can be divided. Stores the indices into the original mesh if its
+// part of that mesh and the vertices it consists of.
+enum { NEW_FACE = -1};
+struct DivFace {
+    Vec3i indx;
+    std::array<Vec3f, 3> verts;
+    long faceid = NEW_FACE;
+    long parent = NEW_FACE;
+};
 
+// Divide a face recursively and call visitor on all the sub-faces.
 template<class Fn>
 void divide_triangle(const DivFace &face, Fn &&visitor)
 {
@@ -366,11 +386,12 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
         return edges[e1].squaredNorm() > edges[e2].squaredNorm();
     });
 
-
     DivFace child1, child2;
-    child1.indx(0) = -1;
-    child1.indx(1) = face.indx(edgeidx[1]);
-    child1.indx(2) = face.indx((edgeidx[1] + 1) % 3);
+
+    child1.parent   = face.faceid == NEW_FACE ? face.parent : face.faceid;
+    child1.indx(0)  = -1;
+    child1.indx(1)  = face.indx(edgeidx[1]);
+    child1.indx(2)  = face.indx((edgeidx[1] + 1) % 3);
     child1.verts[0] = (face.verts[edgeidx[0]] + face.verts[(edgeidx[0] + 1) % 3]) / 2.;
     child1.verts[1] = face.verts[edgeidx[1]];
     child1.verts[2] = face.verts[(edgeidx[1] + 1) % 3];
@@ -378,9 +399,10 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
     if (visitor(child1))
         divide_triangle(child1, std::forward<Fn>(visitor));
 
-    child2.indx(0) = -1;
-    child2.indx(1) = face.indx(edgeidx[2]);
-    child2.indx(2) = face.indx((edgeidx[2] + 1) % 3);
+    child2.parent   = face.faceid == NEW_FACE ? face.parent : face.faceid;
+    child2.indx(0)  = -1;
+    child2.indx(1)  = face.indx(edgeidx[2]);
+    child2.indx(2)  = face.indx((edgeidx[2] + 1) % 3);
     child2.verts[0] = child1.verts[0];
     child2.verts[1] = face.verts[edgeidx[2]];
     child2.verts[2] = face.verts[(edgeidx[2] + 1) % 3];
@@ -389,17 +411,6 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
         divide_triangle(child2, std::forward<Fn>(visitor));
 }
 
-struct BoundingCircle { Vec3f center; double R; };
-
-bool is_undecidable(const Interior &interior, const BoundingCircle &bc)
-{
-    double R = bc.R * interior.voxel_scale;
-    double d = get_distance(bc.center, interior);
-
-    return (d > 0. && R >= interior.nb_out) ||
-           (d < 0. && R >= interior.nb_in) ||
-           ((d - R) < 0. && 2 * R > interior.thickness) ;
-}
 
 void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 {
@@ -410,9 +421,68 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     auto  bb       = interior.mesh.bounding_box();
 
     std::vector<bool> to_remove(faces.size(), false);
-    std::vector<std::array<Vec3f, 3>> new_triangles;
 
-    for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx) {
+    struct {
+        std::vector<std::array<Vec3f, 3>> data;
+        ccr_seq::SpinningMutex           mutex;
+
+        void emplace_back(const std::array<Vec3f, 3> &pts)
+        {
+            std::lock_guard lk{mutex};
+            data.emplace_back(pts);
+        }
+
+    } new_triangles;
+
+    // Must return true if further division of the face is needed.
+    auto divfn = [&interior, &bb, &to_remove, &new_triangles](const DivFace &f)
+    {
+        BoundingBoxf3 facebb { f.verts.begin(), f.verts.end() };
+
+        // Face is certainly outside the cavity
+        if (! facebb.intersects(bb))
+            return false;
+
+        TriangleBubble bubble{facebb.center().cast<float>(), facebb.radius()};
+
+        double D = get_distance(bubble, interior);
+        double R = bubble.R * interior.voxel_scale;
+
+        if (std::isnan(D)) // The distance cannot be measured, triangle too big
+            return true;
+
+        // Distance of the bubble wall to the interior wall. Negative if the
+        // bubble is overlapping with the interior
+        double bubble_distance = D - R;
+
+        // The face is crossing the interior, it must be removed, and parts
+        // of it re-added, that are outside the interior
+        if (bubble_distance < 0.) {
+            if (f.faceid != NEW_FACE)
+                to_remove[f.faceid] = true;
+
+            if (f.parent != NEW_FACE) // Top parent needs to be removed as well
+                to_remove[f.parent] = true;
+
+            // If the outside part is between the interior end the exterior
+            // (inside the wall being invisible), no further division is needed.
+            if ((R + D) < interior.thickness)
+                return false;
+
+            return true;
+        } else { // Face completely outside.
+
+            if (f.faceid == NEW_FACE)  { // New face needs to be re-added
+                new_triangles.emplace_back(f.verts);
+            }
+        }
+
+        return false;
+    };
+
+    ccr_seq::for_each(size_t(0), faces.size(),
+                  [&faces, &vertices, bb, divfn] (size_t face_idx)
+    {
         const Vec3i &face = faces[face_idx];
 
         std::array<Vec3f, 3> pts =
@@ -421,92 +491,28 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         BoundingBoxf3 facebb { pts.begin(), pts.end() };
 
         // Face is certainly outside the cavity
-        if (! facebb.intersects(bb)) continue;
+        if (! facebb.intersects(bb)) return;
 
-        // Create the bounding circle around the face and measure the distance
-        // of its center from the interior wall. This distance may only be valid
-        // if is within the range of the interior's voxelization distance.
-        // It will be checked further with is_undecidable() function.
-        BoundingCircle bcirc{facebb.center().cast<float>(), facebb.radius()};
-        double bcircR = bcirc.R * interior.voxel_scale;
-        double D = get_distance_corrected(bcirc.center, interior);
+        DivFace df{face, pts, long(face_idx)};
 
-        bool child_touching = false;
-        if (is_undecidable(interior, bcirc)) {
-            // D is not valid, lets split the face to reduce the bounding circle
-            // radius.
+        if (divfn(df))
+            divide_triangle(df, divfn);
 
-            auto divfn = [&child_touching, &interior](const DivFace &f)
-            {
-                BoundingBoxf3 fbb{f.verts.begin(), f.verts.end()};
-                BoundingCircle bc{fbb.center().cast<float>(), fbb.radius()};
+    }, ccr_seq::max_concurreny());
 
-                double bcR  = bc.R * interior.voxel_scale;
+    auto new_faces = reserve_vector<Vec3i>(faces.size() +
+                                           new_triangles.data.size());
 
-                double subD = get_distance_corrected(bc.center, interior);
-
-                if (child_touching) return false;
-
-                if (!is_undecidable(interior, bc)) {
-                    child_touching = (subD - bcR) < 0.;
-
-                    return false; // Don't split further
-                }
-
-                return true; // Split further
-            };
-
-            divide_triangle({faces[face_idx], pts}, divfn);
-
-        } else // D is reliable, check if the face touches the interior
-            child_touching = (D - bcircR) < 0.;
-
-        // TODO:
-        // D -= interior.closing_distance;
-        if (child_touching) { // Fully inside
-            to_remove[face_idx] = true;
-        }
-    }
-
-    auto new_faces = reserve_vector<Vec3i>(faces.size() + new_triangles.size());
     for (size_t face_idx = 0; face_idx < faces.size(); ++face_idx) {
-        if (!to_remove[face_idx]) {
+        if (!to_remove[face_idx])
             new_faces.emplace_back(faces[face_idx]);
-        }
-        else {
-            auto divfn = [&interior, &new_triangles](const DivFace &f) {
-                BoundingBoxf3 fbb{f.verts.begin(), f.verts.end()};
-                BoundingCircle bc{fbb.center().cast<float>(), fbb.radius()};
-
-                double bcR = bc.R * interior.voxel_scale;
-
-                double D = get_distance_corrected(bc.center, interior);
-                double d = D - bcR;
-
-                if (d >= 0.) {
-                    new_triangles.emplace_back(f.verts);
-                    return false;
-                }
-
-                if ((2 * bcR + d) < interior.thickness)
-                    return false;
-
-                return true;
-            };
-
-            const Vec3i &face = faces[face_idx];
-            std::array<Vec3f, 3> pts =
-                { vertices[face(0)], vertices[face(1)], vertices[face(2)] };
-
-            divide_triangle({face, pts}, divfn);
-        }
     }
 
-    for(size_t i = 0; i < new_triangles.size(); ++i) {
+    for(size_t i = 0; i < new_triangles.data.size(); ++i) {
         size_t o = vertices.size();
-        vertices.emplace_back(new_triangles[i][0]);
-        vertices.emplace_back(new_triangles[i][1]);
-        vertices.emplace_back(new_triangles[i][2]);
+        vertices.emplace_back(new_triangles.data[i][0]);
+        vertices.emplace_back(new_triangles.data[i][1]);
+        vertices.emplace_back(new_triangles.data[i][2]);
         new_faces.emplace_back(int(o), int(o + 1), int(o + 2));
     }
 
@@ -515,7 +521,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     BOOST_LOG_TRIVIAL(info)
             << "Trimming: " << cnt << " triangles removed";
     BOOST_LOG_TRIVIAL(info)
-            << "Trimming: " << new_triangles.size() << " triangles added";
+            << "Trimming: " << new_triangles.data.size() << " triangles added";
 
     faces.swap(new_faces);
     new_faces = {};

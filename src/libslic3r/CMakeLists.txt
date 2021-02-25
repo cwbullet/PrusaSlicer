@@ -19,7 +19,6 @@ add_library(libslic3r STATIC
     pchheader.hpp
     BoundingBox.cpp
     BoundingBox.hpp
-    BoundingCircle.hpp
     BridgeDetector.cpp
     BridgeDetector.hpp
     Brim.cpp

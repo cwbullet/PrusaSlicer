@@ -7,7 +7,6 @@
 #include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/SimplifyMesh.hpp>
 #include <libslic3r/SLA/SupportTreeMesher.hpp>
-#include <libslic3r/BoundingCircle.hpp>
 
 #include <boost/log/trivial.hpp>
 
@@ -394,7 +393,9 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
         divide_triangle(child2, std::forward<Fn>(visitor));
 }
 
-bool is_undecidable(const Interior &interior, const BoundingCircle3f &bc)
+struct BoundingCircle { Vec3f center; double R; };
+
+bool is_undecidable(const Interior &interior, const BoundingCircle &bc)
 {
     double R = bc.R * interior.voxel_scale;
     double d = get_distance(bc.center, interior);
@@ -429,7 +430,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         // of its center from the interior wall. This distance may only be valid
         // if is within the range of the interior's voxelization distance.
         // It will be checked further with is_undecidable() function.
-        BoundingCircle3f bcirc{pts};
+        BoundingCircle bcirc{facebb.center().cast<float>(), facebb.radius()};
         double bcircR = bcirc.R * interior.voxel_scale;
         double D = get_distance_corrected(bcirc.center, interior);
 
@@ -440,7 +441,9 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
             auto divfn = [&child_touching, &interior](const DivFace &f)
             {
-                BoundingCircle3f bc{f.verts};
+                BoundingBoxf3 fbb{f.verts.begin(), f.verts.end()};
+                BoundingCircle bc{fbb.center().cast<float>(), fbb.radius()};
+
                 double bcR  = bc.R * interior.voxel_scale;
 
                 double subD = get_distance_corrected(bc.center, interior);
@@ -448,7 +451,8 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
                 if (child_touching) return false;
 
                 if (!is_undecidable(interior, bc)) {
-                    child_touching = (subD < 0. && abs(subD) > bcR) || std::abs(subD) < bcR;
+                    child_touching =
+                        (subD < 0. && abs(subD) > bcR) || std::abs(subD) < bcR;
 
                     return false; // Don't split further
                 }
@@ -475,13 +479,10 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         }
         else {
             auto divfn = [&interior, &new_triangles](const DivFace &f) {
-                BoundingCircle3f bc{f.verts};
+                BoundingBoxf3 fbb{f.verts.begin(), f.verts.end()};
+                BoundingCircle bc{fbb.center().cast<float>(), fbb.radius()};
 
                 double bcR = bc.R * interior.voxel_scale;
-
-                if (bcR > 1000. ) {
-                    std::cout << "incorrect radius" << std::endl;
-                }
 
                 double D = get_distance_corrected(bc.center, interior);
                 double d = D - bcR;
@@ -515,8 +516,10 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
     size_t cnt = std::accumulate(to_remove.begin(), to_remove.end(), size_t(0));
 
-    std::cout << cnt << " triangles removed" << std::endl;
-    std::cout << new_triangles.size() << " triangles added" << std::endl;
+    BOOST_LOG_TRIVIAL(info)
+            << "Trimming: " << cnt << " triangles removed";
+    BOOST_LOG_TRIVIAL(info)
+            << "Trimming: " << new_triangles.size() << " triangles added";
 
     faces.swap(new_faces);
     new_faces = {};

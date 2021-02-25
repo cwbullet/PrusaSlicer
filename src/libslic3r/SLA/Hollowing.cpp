@@ -397,7 +397,8 @@ bool is_undecidable(const Interior &interior, const BoundingCircle &bc)
     double d = get_distance(bc.center, interior);
 
     return (d > 0. && R >= interior.nb_out) ||
-           (d < 0. && R >= interior.nb_in);
+           (d < 0. && R >= interior.nb_in) ||
+           ((d - R) < 0. && 2 * R > interior.thickness) ;
 }
 
 void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
@@ -447,8 +448,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
                 if (child_touching) return false;
 
                 if (!is_undecidable(interior, bc)) {
-                    child_touching =
-                        (subD < 0. && abs(subD) > bcR) || std::abs(subD) < bcR;
+                    child_touching = (subD - bcR) < 0.;
 
                     return false; // Don't split further
                 }
@@ -459,7 +459,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
             divide_triangle({faces[face_idx], pts}, divfn);
 
         } else // D is reliable, check if the face touches the interior
-            child_touching = (D < 0. && abs(D) > bcircR) || std::abs(D) < bcircR;
+            child_touching = (D - bcircR) < 0.;
 
         // TODO:
         // D -= interior.closing_distance;

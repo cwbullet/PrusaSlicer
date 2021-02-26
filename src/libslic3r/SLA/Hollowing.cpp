@@ -416,15 +416,18 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 {
     enum TrPos { posInside, posTouch, posOutside };
 
-    auto &faces    = mesh.its.indices;
-    auto &vertices = mesh.its.vertices;
-    auto  bb       = interior.mesh.bounding_box();
+    auto &faces       = mesh.its.indices;
+    auto &vertices    = mesh.its.vertices;
+    auto  interior_bb = interior.mesh.bounding_box();
 
     std::vector<bool> to_remove(faces.size(), false);
 
+    // TODO: Parallel mode not working yet
+    using exec_policy = ccr_seq;
+
     struct {
         std::vector<std::array<Vec3f, 3>> data;
-        ccr_seq::SpinningMutex           mutex;
+        exec_policy::SpinningMutex        mutex;
 
         void emplace_back(const std::array<Vec3f, 3> &pts)
         {
@@ -435,13 +438,15 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     } new_triangles;
 
     // Must return true if further division of the face is needed.
-    auto divfn = [&interior, &bb, &to_remove, &new_triangles](const DivFace &f)
+    auto divfn =
+        [&interior, &interior_bb, &to_remove, &new_triangles](const DivFace &f)
     {
         BoundingBoxf3 facebb { f.verts.begin(), f.verts.end() };
 
         // Face is certainly outside the cavity
-        if (! facebb.intersects(bb))
+        if (! facebb.intersects(interior_bb) && f.faceid != NEW_FACE) {
             return false;
+        }
 
         TriangleBubble bubble{facebb.center().cast<float>(), facebb.radius()};
 
@@ -455,8 +460,8 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         // bubble is overlapping with the interior
         double bubble_distance = D - R;
 
-        // The face is crossing the interior, it must be removed, and parts
-        // of it re-added, that are outside the interior
+        // The face is crossing the interior or inside, it must be removed and
+        // parts of it re-added, that are outside the interior
         if (bubble_distance < 0.) {
             if (f.faceid != NEW_FACE)
                 to_remove[f.faceid] = true;
@@ -470,18 +475,18 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
                 return false;
 
             return true;
-        } else { // Face completely outside.
-
-            if (f.faceid == NEW_FACE)  { // New face needs to be re-added
-                new_triangles.emplace_back(f.verts);
-            }
+        } else if (f.faceid == NEW_FACE) {
+            // New face completely outside needs to be re-added.
+            new_triangles.emplace_back(f.verts);
         }
 
         return false;
     };
 
-    ccr_seq::for_each(size_t(0), faces.size(),
-                  [&faces, &vertices, bb, divfn] (size_t face_idx)
+    interior.reset_accessor();
+
+    exec_policy::for_each(size_t(0), faces.size(),
+                  [&faces, &vertices, interior_bb, divfn] (size_t face_idx)
     {
         const Vec3i &face = faces[face_idx];
 
@@ -491,14 +496,14 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         BoundingBoxf3 facebb { pts.begin(), pts.end() };
 
         // Face is certainly outside the cavity
-        if (! facebb.intersects(bb)) return;
+        if (! facebb.intersects(interior_bb)) return;
 
         DivFace df{face, pts, long(face_idx)};
 
         if (divfn(df))
             divide_triangle(df, divfn);
 
-    }, ccr_seq::max_concurreny());
+    }, exec_policy::max_concurreny());
 
     auto new_faces = reserve_vector<Vec3i>(faces.size() +
                                            new_triangles.data.size());

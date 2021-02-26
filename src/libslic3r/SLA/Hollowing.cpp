@@ -359,7 +359,11 @@ static double get_distance(const TriangleBubble &b, const Interior &interior)
            (D < 0. && R >= interior.nb_in)  ||
            ((D - R) < 0. && 2 * R > interior.thickness) ?
                 std::nan("") :
-                D - interior.closing_distance;
+                // FIXME: Adding interior.voxel_scale is a compromise supposed
+                // to prevent the deletion of the triangles forming the interior
+                // itself. This has a side effect that a small portion of the
+                // bad triangles will still be visible.
+                D - interior.closing_distance + interior.voxel_scale;
 }
 
 // A face that can be divided. Stores the indices into the original mesh if its

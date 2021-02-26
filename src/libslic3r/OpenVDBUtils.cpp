@@ -54,26 +54,23 @@ openvdb::FloatGrid::Ptr mesh_to_grid(const TriangleMesh &            mesh,
 {
     openvdb::initialize();
 
-    TriangleMeshPtrs meshparts = mesh.split();
+    TriangleMeshPtrs meshparts_raw = mesh.split();
+    auto meshparts = reserve_vector<std::unique_ptr<TriangleMesh>>(meshparts_raw.size());
+    for (auto *p : meshparts_raw)
+        meshparts.emplace_back(p);
 
-    auto it = std::remove_if(meshparts.begin(), meshparts.end(),
-                             [](TriangleMesh *m){
-                                 m->require_shared_vertices();
-                                 return !m->is_manifold() || m->volume() < EPSILON;
-                             });
-
-    for (auto p = it; it != meshparts.end(); ++p)
-        delete *p;
+    auto it = std::remove_if(meshparts.begin(), meshparts.end(), [](auto &m) {
+         m->require_shared_vertices();
+         return m->volume() < EPSILON;
+     });
 
     meshparts.erase(it, meshparts.end());
 
     openvdb::FloatGrid::Ptr grid;
-    for (TriangleMesh *m : meshparts) {
+    for (auto &m : meshparts) {
         auto subgrid = openvdb::tools::meshToVolume<openvdb::FloatGrid>(
             TriangleMeshDataAdapter{*m, voxel_scale}, tr, exteriorBandWidth,
             interiorBandWidth, flags);
-
-        delete m;
 
         if (grid && subgrid) openvdb::tools::csgUnion(*grid, *subgrid);
         else if (subgrid) grid = std::move(subgrid);

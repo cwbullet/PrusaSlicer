@@ -1,4 +1,5 @@
 #include <functional>
+#include <unordered_set>
 
 #include <libslic3r/OpenVDBUtils.hpp>
 #include <libslic3r/TriangleMesh.hpp>
@@ -363,7 +364,7 @@ static double get_distance(const TriangleBubble &b, const Interior &interior)
                 // to prevent the deletion of the triangles forming the interior
                 // itself. This has a side effect that a small portion of the
                 // bad triangles will still be visible.
-                D - interior.closing_distance + interior.voxel_scale;
+                D - interior.closing_distance /*+ 2 * interior.voxel_scale*/;
 }
 
 // A face that can be divided. Stores the indices into the original mesh if its
@@ -415,6 +416,19 @@ void divide_triangle(const DivFace &face, Fn &&visitor)
         divide_triangle(child2, std::forward<Fn>(visitor));
 }
 
+std::string facehash(const Vec3i &face, const std::vector<Vec3f> &vertices)
+{
+    std::array<Vec3crd, 3> pts = {
+        scaled(vertices[face(0)]),
+        scaled(vertices[face(1)]),
+        scaled(vertices[face(2)])
+    };
+
+    Vec3crd a = pts[0] - pts[2], b = pts[1] - pts[2];
+    Vec3crd c = a.cross(b);
+
+    return std::to_string(c(0)) + std::to_string(c(1)) + std::to_string(c(2));
+};
 
 void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 {
@@ -440,6 +454,13 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
         }
 
     } new_triangles;
+
+    std::unordered_set<std::string> interior_facehash;
+
+    for (const Vec3i &face : interior.mesh.its.indices) {
+        std::string keystr = facehash(face, interior.mesh.its.vertices);
+        interior_facehash.insert(keystr);
+    }
 
     // Must return true if further division of the face is needed.
     auto divfn =
@@ -490,9 +511,13 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
     interior.reset_accessor();
 
     exec_policy::for_each(size_t(0), faces.size(),
-                  [&faces, &vertices, interior_bb, divfn] (size_t face_idx)
+                  [&faces, &vertices, interior_bb, divfn, &interior_facehash] (size_t face_idx)
     {
         const Vec3i &face = faces[face_idx];
+
+        auto res = interior_facehash.find(facehash(face, vertices));
+        if (res != interior_facehash.end())
+            return;
 
         std::array<Vec3f, 3> pts =
             { vertices[face(0)], vertices[face(1)], vertices[face(2)] };

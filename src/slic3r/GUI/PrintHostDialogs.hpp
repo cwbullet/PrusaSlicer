@@ -74,8 +74,9 @@ private:
         COL_PROGRESS,
         COL_STATUS,
         COL_HOST,
+        COL_SIZE,
         COL_FILENAME,
-        COL_ERRORMSG,
+        COL_ERRORMSG
     };
 
     enum JobState {

@@ -184,12 +184,22 @@ PrintHostQueueDialog::PrintHostQueueDialog(wxWindow *parent)
 
     job_list = new wxDataViewListCtrl(this, wxID_ANY);
     // Note: Keep these in sync with Column
-    job_list->AppendTextColumn(_L("ID"), wxDATAVIEW_CELL_INERT);
-    job_list->AppendProgressColumn(_L("Progress"), wxDATAVIEW_CELL_INERT);
-    job_list->AppendTextColumn(_L("Status"), wxDATAVIEW_CELL_INERT);
-    job_list->AppendTextColumn(_L("Host"), wxDATAVIEW_CELL_INERT);
-    job_list->AppendTextColumn(_L("Filename"), wxDATAVIEW_CELL_INERT);
+    job_list->AppendTextColumn(_L("ID"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
+    job_list->AppendProgressColumn(_L("Progress"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
+    job_list->AppendTextColumn(_L("Status"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
+    job_list->AppendTextColumn(_L("Host"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
+    job_list->AppendTextColumn(_L("Size"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
+    job_list->AppendTextColumn(_L("Filename"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE | wxDATAVIEW_COL_SORTABLE);
     job_list->AppendTextColumn(_L("Error Message"), wxDATAVIEW_CELL_INERT, -1, wxALIGN_CENTER, wxDATAVIEW_COL_HIDDEN);
+ 
+    /*
+    job_list->Bind(wxEVT_DATAVIEW_ITEM_EXPANDING,[this, em](wxDataViewEvent& evt) {
+        for (size_t i = 0; i < job_list->GetColumnCount(); i++) {
+            auto *col = job_list->GetColumn(i);
+            BOOST_LOG_TRIVIAL(error) << "col:" << i << " width: " << col->GetWidth();
+        }
+    });
+    */
 
     auto *btnsizer = new wxBoxSizer(wxHORIZONTAL);
     btn_cancel = new wxButton(this, wxID_DELETE, _L("Cancel selected"));
@@ -207,8 +217,24 @@ PrintHostQueueDialog::PrintHostQueueDialog(wxWindow *parent)
     topsizer->Add(btnsizer, 0, wxEXPAND);
     SetSizer(topsizer);
 
-    SetSize(wxSize(HEIGHT * em, WIDTH * em));
+    Bind(wxEVT_SIZE, [this, em](wxSizeEvent& evt) {
+        OnSize(evt);
+        wxGetApp().app_config->set("print_host_queue_dialog_height", std::to_string(this->GetSize().x / em));
+        wxGetApp().app_config->set("print_host_queue_dialog_width" , std::to_string(this->GetSize().y / em));
+     });
+     
+    int saved_height = std::max((int)HEIGHT, wxGetApp().app_config->has("print_host_queue_dialog_height") ? std::stoi(wxGetApp().app_config->get("print_host_queue_dialog_height")) : 0);
+    int saved_width = std::max((int)WIDTH, wxGetApp().app_config->has("print_host_queue_dialog_width") ? std::stoi(wxGetApp().app_config->get("print_host_queue_dialog_width")) : 0);
+    SetSize(wxSize(saved_height * em, saved_width * em));
+    
+    if (wxGetApp().app_config->has("print_host_queue_dialog_x") && wxGetApp().app_config->has("print_host_queue_dialog_y"))
+        SetPosition(wxPoint(std::stoi(wxGetApp().app_config->get("print_host_queue_dialog_x")), std::stoi(wxGetApp().app_config->get("print_host_queue_dialog_y"))));
 
+    Bind(wxEVT_MOVE, [this, em](wxMoveEvent& evt) {
+        wxGetApp().app_config->set("print_host_queue_dialog_x", std::to_string(this->GetPosition().x));
+        wxGetApp().app_config->set("print_host_queue_dialog_y", std::to_string(this->GetPosition().y));
+    });
+    
     job_list->Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, [this](wxDataViewEvent&) { on_list_select(); });
 
     btn_cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
@@ -238,6 +264,12 @@ void PrintHostQueueDialog::append_job(const PrintHostJob &job)
     fields.push_back(wxVariant(0));
     fields.push_back(wxVariant(_L("Enqueued")));
     fields.push_back(wxVariant(job.printhost->get_host()));
+    boost::system::error_code ec;
+    boost::uintmax_t size_i = boost::filesystem::file_size(job.upload_data.source_path, ec);
+    std::string size = ec ? "unknown" : ((size_i >> 10) > 1024  ? std::to_string((float)(size_i >> 10)/1024) + "MB" : std::to_string(size_i >> 10) + "KB");
+    if (ec)
+        BOOST_LOG_TRIVIAL(error) << ec.message();
+    fields.push_back(wxVariant(size));
     fields.push_back(wxVariant(job.upload_data.upload_path.string()));
     fields.push_back(wxVariant(""));
     job_list->AppendItem(fields, static_cast<wxUIntPtr>(ST_NEW));
@@ -330,6 +362,7 @@ void PrintHostQueueDialog::on_cancel(Event &evt)
 
     on_list_select();
 }
+
 void PrintHostQueueDialog::get_active_jobs(std::vector<std::pair<std::string, std::string>>& ret)
 {
     int ic = job_list->GetItemCount();

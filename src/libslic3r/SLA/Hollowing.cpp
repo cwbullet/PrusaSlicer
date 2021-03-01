@@ -137,9 +137,14 @@ InteriorPtr generate_interior(const TriangleMesh &   mesh,
 
         // This flips the normals to be outward facing...
         interior->mesh.require_shared_vertices();
+        size_t orig_faces = interior->mesh.its.indices.size();
         indexed_triangle_set its = std::move(interior->mesh.its);
 
         Slic3r::simplify_mesh(its);
+
+        BOOST_LOG_TRIVIAL(info)
+                << "Hollowing: simplified interior removed faced: "
+                << orig_faces - its.indices.size();
 
         // flip normals back...
         for (stl_triangle_vertex_indices &ind : its.indices)
@@ -430,7 +435,8 @@ std::string facehash(const Vec3i &face, const std::vector<Vec3f> &vertices)
     return std::to_string(c(0)) + std::to_string(c(1)) + std::to_string(c(2));
 };
 
-void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
+void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior,
+                             const std::vector<DrainHole> &drainholes)
 {
     enum TrPos { posInside, posTouch, posOutside };
 
@@ -510,9 +516,7 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
     interior.reset_accessor();
 
-    exec_policy::for_each(size_t(0), faces.size(),
-                  [&faces, &vertices, interior_bb, divfn, &interior_facehash] (size_t face_idx)
-    {
+    exec_policy::for_each(size_t(0), faces.size(), [&] (size_t face_idx) {
         const Vec3i &face = faces[face_idx];
 
         auto res = interior_facehash.find(facehash(face, vertices));
@@ -521,6 +525,20 @@ void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior)
 
         std::array<Vec3f, 3> pts =
             { vertices[face(0)], vertices[face(1)], vertices[face(2)] };
+
+        Vec3d tr_center = (pts[0] + pts[1] + pts[2]).cast<double>() / 3.;
+        for (const DrainHole &dh : drainholes) {
+            Vec3d dhpos = dh.pos.cast<double>();
+            Vec3d dhend = dhpos + dh.normal.cast<double>() * dh.height;
+            Linef3 holeaxis{dhpos, dhend};
+
+            double D_hole_center = line_alg::distance_to(holeaxis, tr_center);
+            double D_hole = std::abs(D_hole_center - dh.radius);
+            if (D_hole <  2. / interior.voxel_scale) {
+                // TODO: add every neighboring face to interior_facehash
+                return;
+            }
+        }
 
         BoundingBoxf3 facebb { pts.begin(), pts.end() };
 

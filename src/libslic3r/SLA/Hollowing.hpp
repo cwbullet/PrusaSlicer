@@ -81,7 +81,8 @@ void hollow_mesh(TriangleMesh &mesh, const HollowingConfig &cfg, int flags = 0);
 // Hollowing prepared in "interior", merge with original mesh
 void hollow_mesh(TriangleMesh &mesh, const Interior &interior, int flags = 0);
 
-void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior);
+void remove_inside_triangles(TriangleMesh &mesh, const Interior &interior,
+                             const std::vector<DrainHole> &drainholes = {});
 
 void cut_drainholes(std::vector<ExPolygons> & obj_slices,
                     const std::vector<float> &slicegrid,
